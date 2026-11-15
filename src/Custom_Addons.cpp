@@ -143,18 +143,6 @@ namespace
         return g_lockedBeds.find(key) != g_lockedBeds.end();
     }
 
-    void SyncBedName(Building* b)
-    {
-        if (!b || !IsValidBedBuilding(b)) return;
-
-        bool locked = IsBedHandleLocked(b->getHandle());
-        const std::string& curName = b->getName();
-        if (locked && curName != "Bed [IA: BLOQUEADA]")
-            b->setName("Bed [IA: BLOQUEADA]");
-        else if (!locked && curName == "Bed [IA: BLOQUEADA]")
-            b->setName("Bed [IA: PERMITIDA]");
-    }
-
     void ToggleBed(Building* b)
     {
         if (!IsValidBedBuilding(b)) return;
@@ -167,17 +155,66 @@ namespace
             if (it != g_lockedBeds.end())
             {
                 g_lockedBeds.erase(it);
-                b->setName("Bed [IA: PERMITIDA]");
                 LogMsg("[BedLock] Cama desbloqueada para IA.");
             }
             else
             {
                 g_lockedBeds.insert(key);
-                b->setName("Bed [IA: BLOQUEADA]");
                 LogMsg("[BedLock] Cama bloqueada para IA.");
             }
         }
         SaveBedsToDisk();
+    }
+
+    bool HasManualPlayerOrder(Character* c)
+    {
+        if (!c) return false;
+        AI* ai = c->getAI();
+        if (!ai) return false;
+
+        AITaskSytem* ts = ai->getTaskSystem();
+        if (ts && ts->hasPlayerOrders())
+            return true;
+
+        // Si el personaje está siendo cargado por otro (ej. orden manual de meter en cama), revisar al portador
+        hand carrierHandle;
+        Ogre::Vector3 zero(0.0f, 0.0f, 0.0f);
+        if (ai->isBeingCarried(carrierHandle, zero) && carrierHandle.isValid())
+        {
+            Character* carrier = carrierHandle.getCharacter();
+            if (carrier && carrier != c)
+            {
+                AI* carrierAI = carrier->getAI();
+                AITaskSytem* carrierTS = carrierAI ? carrierAI->getTaskSystem() : NULL;
+                if (carrierTS && carrierTS->hasPlayerOrders())
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    bool IsBedAllowedForCharacter(const UseableStuff* self, const hand& h)
+    {
+        if (!self) return true;
+
+        {
+            ScopedLock lock;
+            if (g_lockedBeds.empty()) return true;
+        }
+
+        if (!IsBedHandleLocked(self->getHandle()))
+            return true;
+
+        // Cama bloqueada: solo permitir si existe una orden manual explícita del jugador
+        if (h.isValid())
+        {
+            Character* c = h.getCharacter();
+            if (HasManualPlayerOrder(c))
+                return true;
+        }
+
+        return false;
     }
 
     // --- BOTÓN UI EN MYGUI ---
@@ -269,36 +306,22 @@ namespace
 
     // --- HOOKS NATIVOS ---
 
+    bool (*IsFreeSlotOriginal)(const UseableStuff*, const hand&) = NULL;
+    bool IsFreeSlotHook(const UseableStuff* self, const hand& h)
+    {
+        bool isFree = IsFreeSlotOriginal ? IsFreeSlotOriginal(self, h) : true;
+        if (!isFree) return false;
+
+        return IsBedAllowedForCharacter(self, h);
+    }
+
     bool (*CouldIOperateOriginal)(const UseableStuff*, const hand&) = NULL;
     bool CouldIOperateHook(const UseableStuff* self, const hand& h)
     {
         bool allowed = CouldIOperateOriginal ? CouldIOperateOriginal(self, h) : true;
-        if (!allowed || !self) return allowed;
+        if (!allowed) return false;
 
-        {
-            ScopedLock lock;
-            if (g_lockedBeds.empty()) return true;
-        }
-
-        if (IsBedHandleLocked(self->getHandle()))
-        {
-            // Permitir si el jugador dio orden manual; ignorar si es IA automática
-            if (h.isValid())
-            {
-                Character* c = h.getCharacter();
-                if (c)
-                {
-                    AI* ai = c->getAI();
-                    AITaskSytem* ts = ai ? ai->getTaskSystem() : NULL;
-                    if (ts && ts->hasPlayerOrders())
-                    {
-                        return true;
-                    }
-                }
-            }
-            return false;
-        }
-        return true;
+        return IsBedAllowedForCharacter(self, h);
     }
 
     void (*BuildingGetGUIDataOriginal)(Building*, DatapanelGUI*, int) = NULL;
@@ -308,7 +331,6 @@ namespace
 
         if (self && IsValidBedBuilding(self))
         {
-            SyncBedName(self);
             g_activeBed = self;
         }
 
@@ -323,7 +345,6 @@ namespace
 
         if (self && IsValidBedBuilding(self))
         {
-            SyncBedName(self);
             g_activeBed = self;
         }
 
@@ -394,6 +415,11 @@ __declspec(dllexport) void startPlugin()
         KenshiLib::GetRealAddress(&PlayerInterface::selectObject),
         &PlayerInterfaceSelectObjectHook,
         &PlayerInterfaceSelectObjectOriginal);
+
+    KenshiLib::AddHook(
+        KenshiLib::GetRealAddress(&UseableStuff::_NV_isFreeSlot),
+        &IsFreeSlotHook,
+        &IsFreeSlotOriginal);
 
     KenshiLib::AddHook(
         KenshiLib::GetRealAddress(&UseableStuff::_NV_couldIOperate),
